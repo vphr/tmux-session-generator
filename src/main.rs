@@ -1,23 +1,25 @@
-use std::{error::Error, process::Command, vec};
+use std::{error::Error, fs::write, process::Command};
 
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Session {
     name: String,
     window_count: u8,
     windows: Option<Vec<Window>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Window {
     id: u8,
     name: String,
+    layout: String,
     panes: Option<Vec<Pane>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pane {
     id: u8,
-    size: (u32, u32),
 }
 
 fn main() {
@@ -32,6 +34,12 @@ fn main() {
             Err(e) => eprintln!("could not process session: {}", e),
         }
     }
+    let yaml = serde_yaml::to_string(&parsed_sessions).unwrap();
+    match write("example.yaml", &yaml) {
+        Ok(()) => println!("Wrote to file"),
+        Err(e) => eprintln!("Failed to write to file with error: {}", e),
+    };
+    //print!("{:#}", yaml);
 }
 
 fn get_tmux_info(args: &[&str]) -> Result<Vec<String>, Box<dyn Error>> {
@@ -67,11 +75,40 @@ fn extract_session(input: &str) -> Result<Session, Box<dyn Error>> {
     })
 }
 
+//TODO: Find a better way to do this
+fn extract_layout(window: &str) -> String {
+    let mut pane_layout = window.chars().peekable();
+    let mut layout = String::new();
+    let mut flag = false;
+    while let Some(ch) = &pane_layout.next() {
+        if *ch == '[' && pane_layout.peek() == Some(&'l') {
+            flag = true;
+            loop {
+                if pane_layout.next() == Some(' ') {
+                    break;
+                }
+                pane_layout.next();
+            }
+            continue;
+        }
+        if *ch == ']' && flag {
+            break;
+        }
+        if flag {
+            layout.push(*ch);
+        }
+    }
+    println!("{}", &layout);
+    layout
+}
+
 fn extract_windows(session_name: &str) -> Result<Vec<Window>, Box<dyn Error>> {
     let raw_windows = get_tmux_info(&["list-windows", "-t", session_name]).unwrap();
 
     let mut windows: Vec<Window> = vec![];
     for window in raw_windows {
+        let layout = extract_layout(&window);
+
         let (first, second) = parse_raw_string_tuple(&window)?;
 
         let id: u8 = first
@@ -85,7 +122,12 @@ fn extract_windows(session_name: &str) -> Result<Vec<Window>, Box<dyn Error>> {
             .trim_end_matches(|v| !char::is_alphanumeric(v))
             .to_string();
         let panes = extract_panes(session_name, id).ok();
-        windows.push(Window { name, id, panes });
+        windows.push(Window {
+            name,
+            id,
+            panes,
+            layout,
+        });
     }
     Ok(windows)
 }
@@ -96,25 +138,14 @@ fn extract_panes(session_name: &str, window_id: u8) -> Result<Vec<Pane>, Box<dyn
     let mut pane_vec: Vec<Pane> = vec![];
 
     for pane in panes {
-        let (first, second) = parse_raw_string_tuple(&pane)?;
+        let (first, _) = parse_raw_string_tuple(&pane)?;
         let id: u8 = first
             .chars()
             .filter(|v| v.is_numeric())
             .collect::<String>()
             .parse()?;
 
-        let name = second
-            .chars()
-            .filter(|v| v.is_alphanumeric())
-            .collect::<String>()
-            .replace('x', " ")
-            .split(' ')
-            .map(|v| v.parse::<u32>().unwrap())
-            .collect::<Vec<u32>>();
-        pane_vec.push(Pane {
-            id,
-            size: (name[0], name[1]),
-        });
+        pane_vec.push(Pane { id });
     }
     Ok(pane_vec)
 }
