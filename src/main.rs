@@ -1,4 +1,9 @@
-use std::{error::Error, fs::write, process::Command};
+use std::{
+    error::Error,
+    fs::{write, File},
+    io::Read,
+    process::Command,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +19,7 @@ struct Window {
     id: u8,
     name: String,
     layout: String,
+    pane_count: usize,
     panes: Option<Vec<Pane>>,
 }
 
@@ -23,6 +29,51 @@ struct Pane {
 }
 
 fn main() {
+    let generate_file = false;
+    if generate_file {
+        match generate_tmux_config() {
+            Ok(()) => println!("Wrote to file"),
+            Err(e) => eprintln!("Failed to write to file with error: {}", e),
+        };
+    }
+    let read_file = true;
+
+    if read_file {
+        let mut file = File::open("example.yaml").expect("Unable to open file");
+        let mut contents = String::new();
+
+        file.read_to_string(&mut contents)
+            .expect("Unable to read file");
+
+        let res: Vec<Session> = serde_yaml::from_str(&contents).unwrap();
+        execute_tmux_config(res[0].to_owned());
+    }
+}
+
+fn execute_tmux_config(config: Session) {
+    // println!("{:#?}", config);
+    run_tmux_command(&["new-session", "-d", "-s", &config.name]);
+
+    for window in config.windows.unwrap() {
+        // println!("{:#?}", &window);
+        run_tmux_command(&["new-window", "-d", "-t", &config.name, "-n", &window.name]);
+        let window_arg = format!("{}:{}", &config.name, &window.id);
+        for _ in 0..window.pane_count - 1 {
+            //tmux splitw -h -p 5 -t sess:0.0
+            run_tmux_command(&["split-window", "-h", "-t", &window_arg]);
+        }
+        run_tmux_command(&["select-layout", "-t", &window_arg, &window.layout]);
+    }
+
+    // TEMPORARY CLEAN UP
+    // run_tmux_command(&["kill-session", "-t", &config.name]);
+}
+fn run_tmux_command(args: &[&str]) {
+    let mut cmd = Command::new("tmux");
+    cmd.args(args).spawn().expect("failed to kill session");
+}
+
+fn generate_tmux_config() -> Result<(), Box<dyn Error>> {
     let raw_sessions = get_tmux_info(&["list-sessions"]).unwrap();
     let mut parsed_sessions: Vec<Session> = vec![];
     for session in raw_sessions {
@@ -35,11 +86,7 @@ fn main() {
         }
     }
     let yaml = serde_yaml::to_string(&parsed_sessions).unwrap();
-    match write("example.yaml", &yaml) {
-        Ok(()) => println!("Wrote to file"),
-        Err(e) => eprintln!("Failed to write to file with error: {}", e),
-    };
-    //print!("{:#}", yaml);
+    Ok(write("example.yaml", &yaml)?)
 }
 
 fn get_tmux_info(args: &[&str]) -> Result<Vec<String>, Box<dyn Error>> {
@@ -56,6 +103,7 @@ fn parse_raw_string_tuple(input: &str) -> Result<(&str, &str), Box<dyn Error>> {
 
     let first = input_vec.first().expect("first element if unaccessable");
     let second = input_vec.get(1).expect("second element if unaccessable");
+
     Ok((first, second))
 }
 
@@ -91,14 +139,13 @@ fn extract_layout(window: &str) -> String {
             }
             continue;
         }
-        if *ch == ']' && flag {
+        if *ch == ']' && pane_layout.peek() == Some(&' ') && flag {
             break;
         }
         if flag {
             layout.push(*ch);
         }
     }
-    println!("{}", &layout);
     layout
 }
 
@@ -106,6 +153,7 @@ fn extract_windows(session_name: &str) -> Result<Vec<Window>, Box<dyn Error>> {
     let raw_windows = get_tmux_info(&["list-windows", "-t", session_name]).unwrap();
 
     let mut windows: Vec<Window> = vec![];
+
     for window in raw_windows {
         let layout = extract_layout(&window);
 
@@ -117,15 +165,23 @@ fn extract_windows(session_name: &str) -> Result<Vec<Window>, Box<dyn Error>> {
             .collect::<String>()
             .parse()?;
 
+        let window_arg = format!("{}:{}", session_name, id);
+        let pane_count = get_tmux_info(&["list-pane", "-t", &window_arg])
+            .unwrap()
+            .len();
+
         //remove * and -  from the window name
         let name = second
             .trim_end_matches(|v| !char::is_alphanumeric(v))
             .to_string();
+
         let panes = extract_panes(session_name, id).ok();
+
         windows.push(Window {
             name,
             id,
             panes,
+            pane_count,
             layout,
         });
     }
