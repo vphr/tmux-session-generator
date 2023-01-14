@@ -1,11 +1,36 @@
 use std::{
     error::Error,
     fs::{write, File},
-    io::Read,
+    io::{Read, Write},
     process::Command,
 };
 
+extern crate xdg;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+#[derive(Debug)]
+struct Environment {
+    inside_tmux: bool,
+    full_path: String,
+    working_directory: String,
+    session: Option<Session>,
+}
+
+impl Environment {
+    fn new() -> Result<Self> {
+        let key = "TMUX";
+        let inside_tmux = std::env::var(key).is_ok();
+        let path = std::env::current_dir()?;
+        let full_path = path.to_string_lossy().to_string();
+        let working_directory = full_path.split("/").into_iter().last().unwrap().to_string();
+        Ok(Self {
+            inside_tmux,
+            full_path,
+            working_directory,
+            session: None,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Session {
@@ -28,7 +53,9 @@ struct Pane {
     id: u8,
 }
 
-fn main() {
+fn main() -> Result<()> {
+    let mut env = Environment::new()?;
+
     let generate_file = false;
     if generate_file {
         match generate_tmux_config() {
@@ -39,23 +66,53 @@ fn main() {
     let read_file = true;
 
     if read_file {
-        let mut file = File::open("example.yaml").expect("Unable to open file");
+        let mut file = File::open("example.yaml")?;
         let mut contents = String::new();
 
-        file.read_to_string(&mut contents)
-            .expect("Unable to read file");
+        file.read_to_string(&mut contents)?;
 
-        let res: Vec<Session> = serde_yaml::from_str(&contents).unwrap();
-        execute_tmux_config(res[0].to_owned());
+        let sessions: Vec<Session> = serde_yaml::from_str(&contents)?;
+
+        if sessions.is_empty() || sessions.len() > 1 {
+            return Err(anyhow!(
+                "Invalid configuration file provided with length: {}, expected length 1",
+                sessions.len()
+            ));
+        }
+        env.session = Some(sessions[0].to_owned());
+        execute_tmux_config(env);
     }
+    Ok(())
 }
 
-fn execute_tmux_config(config: Session) {
-    // println!("{:#?}", config);
+fn execute_tmux_config(env: Environment) {
+    let config = env.session.unwrap();
+
     run_tmux_command(&["new-session", "-d", "-s", &config.name]);
 
-    for window in config.windows.unwrap() {
-        // println!("{:#?}", &window);
+    let config_windows = config.windows.as_ref().unwrap();
+
+    let (first_window, rest) = config_windows.split_first().unwrap();
+
+    let initial_window_index = &get_tmux_info(&["list-windows", "-t", &config.name]).unwrap()[0];
+
+    let (initial_window_index, _) = initial_window_index.split_once(":").unwrap();
+
+    run_tmux_command(&[
+        "rename-window",
+        "-t",
+        &format!("{}:{}", &config.name, &initial_window_index),
+        &first_window.name,
+    ]);
+
+    let window_arg = format!("{}:{}", &config.name, &first_window.id);
+    for _ in 0..first_window.pane_count - 1 {
+        //tmux splitw -h -p 5 -t sess:0.0
+        run_tmux_command(&["split-window", "-h", "-t", &window_arg]);
+    }
+    run_tmux_command(&["select-layout", "-t", &window_arg, &first_window.layout]);
+
+    for window in rest {
         run_tmux_command(&["new-window", "-d", "-t", &config.name, "-n", &window.name]);
         let window_arg = format!("{}:{}", &config.name, &window.id);
         for _ in 0..window.pane_count - 1 {
@@ -64,16 +121,25 @@ fn execute_tmux_config(config: Session) {
         }
         run_tmux_command(&["select-layout", "-t", &window_arg, &window.layout]);
     }
-
-    // TEMPORARY CLEAN UP
-    // run_tmux_command(&["kill-session", "-t", &config.name]);
+    
+    
+    if env.inside_tmux{
+    run_tmux_command(&["switch", "-t", &config.name]);
+    }
+    else {
+    run_tmux_command(&["attach", "-t", &config.name]);
+    }
 }
+
 fn run_tmux_command(args: &[&str]) {
     let mut cmd = Command::new("tmux");
-    cmd.args(args).spawn().expect("failed to kill session");
+    cmd.args(args)
+        .spawn()
+        .expect("failed to kill session")
+        .wait();
 }
 
-fn generate_tmux_config() -> Result<(), Box<dyn Error>> {
+fn generate_tmux_config() -> Result<()> {
     let raw_sessions = get_tmux_info(&["list-sessions"]).unwrap();
     let mut parsed_sessions: Vec<Session> = vec![];
     for session in raw_sessions {
@@ -89,7 +155,7 @@ fn generate_tmux_config() -> Result<(), Box<dyn Error>> {
     Ok(write("example.yaml", &yaml)?)
 }
 
-fn get_tmux_info(args: &[&str]) -> Result<Vec<String>, Box<dyn Error>> {
+fn get_tmux_info(args: &[&str]) -> Result<Vec<String>> {
     let mut cmd = Command::new("tmux");
     let output = cmd.args(args).output()?;
 
@@ -98,7 +164,7 @@ fn get_tmux_info(args: &[&str]) -> Result<Vec<String>, Box<dyn Error>> {
         .map(|v| v.to_string())
         .collect())
 }
-fn parse_raw_string_tuple(input: &str) -> Result<(&str, &str), Box<dyn Error>> {
+fn parse_raw_string_tuple(input: &str) -> Result<(&str, &str)> {
     let input_vec = input.split_whitespace().take(2).collect::<Vec<_>>();
 
     let first = input_vec.first().expect("first element if unaccessable");
@@ -149,7 +215,7 @@ fn extract_layout(window: &str) -> String {
     layout
 }
 
-fn extract_windows(session_name: &str) -> Result<Vec<Window>, Box<dyn Error>> {
+fn extract_windows(session_name: &str) -> Result<Vec<Window>> {
     let raw_windows = get_tmux_info(&["list-windows", "-t", session_name]).unwrap();
 
     let mut windows: Vec<Window> = vec![];
@@ -188,7 +254,7 @@ fn extract_windows(session_name: &str) -> Result<Vec<Window>, Box<dyn Error>> {
     Ok(windows)
 }
 
-fn extract_panes(session_name: &str, window_id: u8) -> Result<Vec<Pane>, Box<dyn Error>> {
+fn extract_panes(session_name: &str, window_id: u8) -> Result<Vec<Pane>> {
     let window_arg = format!("{}:{}", session_name, window_id);
     let panes = get_tmux_info(&["list-pane", "-t", &window_arg]).unwrap();
     let mut pane_vec: Vec<Pane> = vec![];
